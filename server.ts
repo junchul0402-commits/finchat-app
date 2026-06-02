@@ -1,8 +1,14 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
-import { createServer as createViteServer } from "vite";
+import { fileURLToPath } from "url";
+
+// Environment-safe directory path determination for both ESM and CommonJS
+const dirName = typeof __dirname !== "undefined"
+  ? __dirname
+  : path.dirname(fileURLToPath(import.meta.url));
 
 // Load environment variables
 dotenv.config();
@@ -191,6 +197,21 @@ app.post("/api/chat", async (req, res) => {
       if (apiError.name === "AbortError" || apiError.message?.includes("abort")) {
         return res.status(504).json({ error: "상담원의 답변이 10초 내에 도착하지 않았습니다. 네트워크 환경을 보거나 재시도 해주세요." });
       }
+
+      const errMsg = apiError.message || "";
+      const errStatus = apiError.status || apiError.statusCode || (apiError.error && apiError.error.code);
+      const isQuotaExhausted = errStatus === 429 || 
+                               errMsg.includes("RESOURCE_EXHAUSTED") || 
+                               errMsg.toLowerCase().includes("quota") || 
+                               errMsg.toLowerCase().includes("rate limit") ||
+                               errMsg.toLowerCase().includes("exhausted") ||
+                               errMsg.toLowerCase().includes("limitexceeded");
+
+      if (isQuotaExhausted) {
+        return res.status(429).json({
+          error: "현재 사용 중이신 Gemini API 키의 **크레딧 또는 할당량(Quota)이 소진**되었거나 **분당 호출 한도(Rate Limit)**에 도달했습니다.\n\n💡 해결 방법:\n1) **분당 호출제한(RPM)초과**: 약 1분 정도 잠시만 대기 후 전송해 보세요.\n2) **일일 무료 할당량 소진**: 하루 제공량이 끝나서 대기해야 할 수 있습니다.\n3) **API 키는 그대로 유지하면서 즉시 한도 늘리기**: Google AI Studio의 Billing 메뉴에서 결제 카드만 등록(Pay-as-you-go 요금제 연동)해주시면, API 키를 바꾸지 않아도 바로 한도가 대폭 상향되어 즉시 원활하게 정상 대화가 가능해집니다."
+        });
+      }
       
       return res.status(502).json({ error: `금융 상담원과의 연결이 원활하지 않습니다. (에러: ${apiError.message || "UNAVAILABLE"}) 잠시 후 질문을 다시 보내주세요.` });
     }
@@ -202,24 +223,78 @@ app.post("/api/chat", async (req, res) => {
 
 // Configure Vite or Static Serve middleware
 async function startApp() {
-  if (process.env.NODE_ENV !== "production") {
-    // Development server with HMR / middleware mode
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
+  let isDevMode = process.env.NODE_ENV !== "production";
+  let vite: any = null;
+
+  if (isDevMode) {
+    try {
+      // Development server with HMR / middleware mode dynamically loading Vite
+      const { createServer: createViteServer } = await import("vite");
+      vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+      console.log("[FinChat Config] Development server with Vite middleware started successfully.");
+    } catch (devLoadErr) {
+      console.warn("[FinChat Warning] Failed to load Vite middleware, falling back to static build serve.", devLoadErr);
+      isDevMode = false;
+    }
+  }
+
+  if (isDevMode && vite) {
+    // Development catch-all to serve index.html with Vite's HTML transforming
+    app.get("*", async (req, res, next) => {
+      const url = req.originalUrl;
+      try {
+        const rootIndex = path.join(process.cwd(), "index.html");
+        if (fs.existsSync(rootIndex)) {
+          let template = fs.readFileSync(rootIndex, "utf-8");
+          template = await vite.transformIndexHtml(url, template);
+          res.status(200).set({ "Content-Type": "text/html" }).end(template);
+        } else {
+          next();
+        }
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
   } else {
     // Production static asset serving
-    const distPath = path.join(process.cwd(), "dist");
+    let distPath = path.join(process.cwd(), "dist");
+
+    // Robust multi-path fallback checking to support various container structures
+    if (!fs.existsSync(path.join(distPath, "index.html"))) {
+      const parentDir = path.dirname(dirName); // parent dir of current file/bundle
+      const pathsToTry = [
+        dirName,                                  // maybe we are running within dist itself
+        path.join(parentDir, "dist"),               // root/dist from outside dist
+        path.join(process.cwd(), "workspace", "dist"), // workspace dir
+        "/workspace/dist"                           // absolute fallback
+      ];
+      for (const p of pathsToTry) {
+        if (p && fs.existsSync(path.join(p, "index.html"))) {
+          distPath = p;
+          break;
+        }
+      }
+    }
+
+    console.log(`[FinChat Config] Production assets path selected: ${distPath}`);
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+      const htmlFile = path.join(distPath, "index.html");
+      if (fs.existsSync(htmlFile)) {
+        res.sendFile(htmlFile);
+      } else {
+        console.error(`[FinChat Error] index.html not found in distPath: ${distPath}`);
+        res.status(404).send("Error: index.html not found on server.");
+      }
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[FinChat App] running on http://localhost:${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
+    console.log(`[FinChat App] running on http://localhost:${PORT} in ${process.env.NODE_ENV || 'production'} mode`);
   });
 }
 
