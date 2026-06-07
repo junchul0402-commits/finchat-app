@@ -126,8 +126,8 @@ app.post("/api/chat", async (req, res) => {
     const timeoutId = setTimeout(() => controller.abort(), 10000);
 
     try {
-      // Robust retry with fallback mechanism to avoid 503 high demand issues
-      const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.5-flash", "gemini-1.5-pro"];
+      // Robust retry with fallback mechanism using valid, modern models
+      const modelsToTry = ["gemini-3.5-flash", "gemini-2.5-flash"];
       let lastError: any = null;
       let replyText = "";
       
